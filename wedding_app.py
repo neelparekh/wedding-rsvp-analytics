@@ -4,6 +4,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sklearn.preprocessing import MultiLabelBinarizer
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import io
 
 # Color scheme constants
 COLOR_BRIDE = '#FF69B4'
@@ -25,7 +28,7 @@ def check_password():
     """Password protection for the app"""
     def password_entered():
         # Get password from Streamlit secrets
-        correct_password = st.secrets.get("app_password", "wedding2024")
+        correct_password = st.secrets.get("app_password")
         
         if st.session_state["password"] == correct_password:
             st.session_state["password_correct"] = True
@@ -48,18 +51,100 @@ def check_password():
     else:
         return True
 
-@st.cache_data
-def load_and_process_data(uploaded_file=None):
+@st.cache_resource
+def init_google_drive():
+    """Initialize Google Drive service"""
+    try:
+        credentials = service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=["https://www.googleapis.com/auth/drive.readonly"]
+        )
+        return build('drive', 'v3', credentials=credentials)
+    except Exception as e:
+        st.error(f"❌ Error connecting to Google Drive: {e}")
+        return None
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def get_latest_csv_from_folder(folder_id):
+    """Get the latest CSV file from a Google Drive folder"""
+    try:
+        drive_service = init_google_drive()
+        if drive_service is None:
+            return None, None
+        
+        # Search for CSV files in the folder
+        query = f"'{folder_id}' in parents and mimeType='text/csv' and trashed=false"
+        results = drive_service.files().list(
+            q=query,
+            orderBy='modifiedTime desc',  # Latest first
+            fields="files(id,name,modifiedTime)",
+            pageSize=10
+        ).execute()
+        
+        files = results.get('files', [])
+        
+        if not files:
+            st.error("❌ No CSV files found in the specified folder")
+            return None, None
+        
+        # Return the latest file
+        latest_file = files[0]
+        return latest_file['id'], latest_file
+        
+    except Exception as e:
+        st.error(f"❌ Error accessing folder: {e}")
+        return None, None
+
+@st.cache_data(ttl=300)
+def load_csv_from_drive(file_id):
+    """Load CSV from Google Drive"""
+    try:
+        drive_service = init_google_drive()
+        if drive_service is None:
+            return None
+            
+        # Download file content
+        request = drive_service.files().get_media(fileId=file_id)
+        file_content = request.execute()
+        
+        # Convert to DataFrame
+        csv_string = file_content.decode('utf-8')
+        df = pd.read_csv(io.StringIO(csv_string))
+        
+        return df
+    except Exception as e:
+        st.error(f"❌ Error loading file from Google Drive: {e}")
+        return None
+
+@st.cache_data(ttl=300)
+def load_and_process_data(uploaded_file=None, use_drive=False, file_id=None, folder_id=None):
     """Load CSV and create invitation indicator columns"""
     try:
-        if uploaded_file is not None:
+        if use_drive and folder_id:
+            # Load latest CSV from folder
+            file_id, file_info = get_latest_csv_from_folder(folder_id)
+            if file_id is None:
+                return None, None
+            df = load_csv_from_drive(file_id)
+            if df is None:
+                return None, None
+        elif use_drive and file_id:
+            # Load from specific Google Drive file
+            df = load_csv_from_drive(file_id)
+            file_info = None
+            if df is None:
+                return None, None
+        elif uploaded_file is not None:
+            # Load from uploaded file
             df = pd.read_csv(uploaded_file)
+            file_info = None
         else:
             # Fallback to local file for development
             try:
                 df = pd.read_csv('full-guest-list-Jul12.csv')
+                file_info = None
             except FileNotFoundError:
-                return None
+                return None, None
         
         # Expected columns
         keep_cols = ['first name', 'last name', 'party', 'tags', 'mehendi rsvp', 'sangeet rsvp', 'wedding rsvp', 'reception rsvp', 'haldi rsvp']
@@ -68,7 +153,7 @@ def load_and_process_data(uploaded_file=None):
         missing_cols = [col for col in keep_cols if col not in df.columns]
         if missing_cols:
             st.error(f"❌ Missing required columns: {missing_cols}")
-            return None
+            return None, None
         
         df = df[keep_cols]
 
@@ -81,11 +166,12 @@ def load_and_process_data(uploaded_file=None):
         tag_indicators = mlb.fit_transform(tags_split)
         tag_df = pd.DataFrame(tag_indicators, columns=mlb.classes_, index=df.index)
         
-        return pd.concat([df, tag_df], axis=1)
+        processed_df = pd.concat([df, tag_df], axis=1)
+        return processed_df, file_info
         
     except Exception as e:
         st.error(f"❌ Error processing file: {str(e)}")
-        return None
+        return None, None
 
 def get_event_stats(df):
     """Calculate comprehensive statistics for each event"""
@@ -182,42 +268,135 @@ def main():
     st.title("💒 Wedding Guest Analytics Dashboard")
     st.markdown("---")
     
-    # File upload section
-    st.subheader("📁 Upload Your Guest List")
-    uploaded_file = st.file_uploader(
-        "Choose a CSV file", 
-        type="csv",
-        help="Upload your guest list CSV with columns: first name, last name, party, tags, mehendi rsvp, sangeet rsvp, wedding rsvp, reception rsvp, haldi rsvp"
+    # Data source selection
+    st.subheader("📊 Choose Data Source")
+    data_source = st.radio(
+        "How would you like to load your guest list?",
+        ["📂 Google Drive Folder (Latest CSV)", "📄 Specific Google Drive File", "📁 Upload CSV File"],
+        help="Folder option automatically uses the newest CSV file in your folder"
     )
     
-    # Show expected format
-    with st.expander("📋 Expected CSV Format"):
-        st.markdown("""
-        Your CSV should have these columns:
-        - **first name**: Guest's first name
-        - **last name**: Guest's last name  
-        - **party**: Party/group information
-        - **tags**: Comma-separated tags (e.g., "B Wedding, B Reception, Save the Date")
-        - **mehendi rsvp**: RSVP status ("attending", "not attending", or empty)
-        - **sangeet rsvp**: RSVP status ("attending", "not attending", or empty)
-        - **wedding rsvp**: RSVP status ("attending", "not attending", or empty)
-        - **reception rsvp**: RSVP status ("attending", "not attending", or empty)
-        - **haldi rsvp**: RSVP status ("attending", "not attending", or empty)
-        """)
+    df = None
+    file_info = None
     
-    # Load and validate data
-    df = load_and_process_data(uploaded_file)
-    
-    if df is None:
-        if uploaded_file is None:
-            st.info("👆 Please upload your guest list CSV file to begin analysis")
+    if data_source.startswith("📂") or data_source.startswith("📄"):  # Google Drive options
+        st.subheader("📂 Google Drive Configuration")
+        
+        # Check if Google Drive is configured
+        if "gcp_service_account" not in st.secrets:
+            st.error("❌ Google Drive not configured. Please add your service account credentials to secrets.")
+            st.markdown("""
+            **To set up Google Drive:**
+            1. Create a service account in Google Cloud Console
+            2. Download the JSON key file
+            3. Add the JSON content to your Streamlit secrets as `gcp_service_account`
+            4. Share your CSV file/folder with the service account email
+            """)
+            st.stop()
+        
+        if data_source.startswith("📂"):  # Folder option
+            # Folder ID input
+            # folder_id = st.text_input(
+            #     "Google Drive Folder ID",
+            #     help="Copy the folder ID from your Google Drive URL: https://drive.google.com/drive/folders/FOLDER_ID_HERE",
+            #     placeholder="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
+            # )
+
+            folder_id="1IQBNaL_37ucZpTZkBdivW9oe6w-_Xgig"
+            
+            if folder_id:
+                with st.spinner("Finding latest CSV in folder..."):
+                    result = load_and_process_data(use_drive=True, folder_id=folder_id)
+                    if result[0] is not None:
+                        df, file_info = result
+                        st.success(f"✅ Loaded {len(df)} guests from latest CSV in folder!")
+                        
+                        # Show file info
+                        if file_info:
+                            st.info(f"📄 Latest file: **{file_info.get('name', 'Unknown')}** | Modified: {file_info.get('modifiedTime', 'Unknown')}")
+                    else:
+                        st.error("❌ Could not load latest CSV from folder. Please check the folder ID and permissions.")
+                        st.stop()
+            else:
+                st.info("👆 Please enter your Google Drive folder ID to continue")
+                with st.expander("🔍 How to find Folder ID"):
+                    st.markdown("""
+                    1. Open your folder in Google Drive
+                    2. Look at the URL: `https://drive.google.com/drive/folders/FOLDER_ID_HERE`
+                    3. Copy the **FOLDER_ID_HERE** part
+                    4. Make sure your folder is shared with the service account email
+                    """)
+                st.stop()
+                
+        else:  # Specific file option
+            # File ID input
+            file_id = st.text_input(
+                "Google Drive File ID",
+                help="Copy the file ID from your Google Drive URL: https://drive.google.com/file/d/FILE_ID_HERE/view",
+                placeholder="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
+            )
+            
+            if file_id:
+                with st.spinner("Loading data from Google Drive..."):
+                    result = load_and_process_data(use_drive=True, file_id=file_id)
+                    if result[0] is not None:
+                        df, _ = result
+                        st.success(f"✅ Loaded {len(df)} guests from Google Drive!")
+                        
+                        # Show last update info
+                        drive_service = init_google_drive()
+                        if drive_service:
+                            try:
+                                file_info_api = drive_service.files().get(fileId=file_id, fields="modifiedTime,name").execute()
+                                st.info(f"📄 File: {file_info_api.get('name', 'Unknown')} | Last modified: {file_info_api.get('modifiedTime', 'Unknown')}")
+                            except:
+                                pass
+                    else:
+                        st.error("❌ Could not load file from Google Drive. Please check the file ID and permissions.")
+                        st.stop()
+            else:
+                st.info("👆 Please enter your Google Drive file ID to continue")
+                st.stop()
+            
+    else:  # Upload CSV File
+        st.subheader("📁 Upload Your Guest List")
+        uploaded_file = st.file_uploader(
+            "Choose a CSV file", 
+            type="csv",
+            help="Upload your guest list CSV with the required columns"
+        )
+        
+        # Show expected format
+        with st.expander("📋 Expected CSV Format"):
+            st.markdown("""
+            Your CSV should have these columns:
+            - **first name**: Guest's first name
+            - **last name**: Guest's last name  
+            - **party**: Party/group information
+            - **tags**: Comma-separated tags (e.g., "B Wedding, B Reception, Save the Date")
+            - **mehendi rsvp**: RSVP status ("attending", "not attending", or empty)
+            - **sangeet rsvp**: RSVP status ("attending", "not attending", or empty)
+            - **wedding rsvp**: RSVP status ("attending", "not attending", or empty)
+            - **reception rsvp**: RSVP status ("attending", "not attending", or empty)
+            - **haldi rsvp**: RSVP status ("attending", "not attending", or empty)
+            """)
+        
+        if uploaded_file is not None:
+            result = load_and_process_data(uploaded_file=uploaded_file)
+            if result[0] is not None:
+                df, _ = result
+                st.success(f"✅ Loaded {len(df)} guests from uploaded file!")
+            else:
+                st.error("❌ Error processing the uploaded file. Please check the format and try again.")
+                st.stop()
         else:
-            st.error("❌ Error processing the uploaded file. Please check the format and try again.")
-        st.stop()
-    
-    st.success(f"✅ Loaded {len(df)} guests successfully!")
+            st.info("👆 Please upload your guest list CSV file to begin analysis")
+            st.stop()
     
     # Only proceed if we have valid data
+    if df is None:
+        st.stop()
+        
     stats_df = get_event_stats(df)
     
     # Create navigation tabs
