@@ -21,23 +21,71 @@ st.set_page_config(
     layout="wide"
 )
 
-@st.cache_data
-def load_and_process_data():
-    """Load CSV and create invitation indicator columns"""
-    df = pd.read_csv('full-guest-list-Jul12.csv')
-    keep_cols = ['first name', 'last name', 'party', 'tags', 'mehendi rsvp', 'sangeet rsvp', 'wedding rsvp', 'reception rsvp', 'haldi rsvp']
-    df = df[keep_cols]
+def check_password():
+    """Password protection for the app"""
+    def password_entered():
+        # Get password from Streamlit secrets
+        correct_password = st.secrets.get("app_password", "wedding2024")
+        
+        if st.session_state["password"] == correct_password:
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]
+        else:
+            st.session_state["password_correct"] = False
 
-    # Convert tags to invitation indicators
-    tags_split = df['tags'].fillna('').str.split(',').apply(
-        lambda x: [tag.strip() + ' Invitation' for tag in x if tag.strip()]
-    )
-    
-    mlb = MultiLabelBinarizer()
-    tag_indicators = mlb.fit_transform(tags_split)
-    tag_df = pd.DataFrame(tag_indicators, columns=mlb.classes_, index=df.index)
-    
-    return pd.concat([df, tag_df], axis=1)
+    # Check if password is already correct
+    if "password_correct" not in st.session_state:
+        st.title("🔒 Wedding Guest Analytics")
+        st.markdown("Please enter the password to access the dashboard")
+        st.text_input("Password", type="password", on_change=password_entered, key="password")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.title("🔒 Wedding Guest Analytics")
+        st.markdown("Please enter the password to access the dashboard")
+        st.text_input("Password", type="password", on_change=password_entered, key="password")
+        st.error("❌ Incorrect password. Please try again.")
+        return False
+    else:
+        return True
+
+@st.cache_data
+def load_and_process_data(uploaded_file=None):
+    """Load CSV and create invitation indicator columns"""
+    try:
+        if uploaded_file is not None:
+            df = pd.read_csv(uploaded_file)
+        else:
+            # Fallback to local file for development
+            try:
+                df = pd.read_csv('full-guest-list-Jul12.csv')
+            except FileNotFoundError:
+                return None
+        
+        # Expected columns
+        keep_cols = ['first name', 'last name', 'party', 'tags', 'mehendi rsvp', 'sangeet rsvp', 'wedding rsvp', 'reception rsvp', 'haldi rsvp']
+        
+        # Check if required columns exist
+        missing_cols = [col for col in keep_cols if col not in df.columns]
+        if missing_cols:
+            st.error(f"❌ Missing required columns: {missing_cols}")
+            return None
+        
+        df = df[keep_cols]
+
+        # Convert tags to invitation indicators
+        tags_split = df['tags'].fillna('').str.split(',').apply(
+            lambda x: [tag.strip() + ' Invitation' for tag in x if tag.strip()]
+        )
+        
+        mlb = MultiLabelBinarizer()
+        tag_indicators = mlb.fit_transform(tags_split)
+        tag_df = pd.DataFrame(tag_indicators, columns=mlb.classes_, index=df.index)
+        
+        return pd.concat([df, tag_df], axis=1)
+        
+    except Exception as e:
+        st.error(f"❌ Error processing file: {str(e)}")
+        return None
 
 def get_event_stats(df):
     """Calculate comprehensive statistics for each event"""
@@ -127,17 +175,49 @@ def create_pie_chart(values, names, title, color_map):
     return fig
 
 def main():
+    # Check password before showing the app
+    if not check_password():
+        return
+        
     st.title("💒 Wedding Guest Analytics Dashboard")
     st.markdown("---")
     
+    # File upload section
+    st.subheader("📁 Upload Your Guest List")
+    uploaded_file = st.file_uploader(
+        "Choose a CSV file", 
+        type="csv",
+        help="Upload your guest list CSV with columns: first name, last name, party, tags, mehendi rsvp, sangeet rsvp, wedding rsvp, reception rsvp, haldi rsvp"
+    )
+    
+    # Show expected format
+    with st.expander("📋 Expected CSV Format"):
+        st.markdown("""
+        Your CSV should have these columns:
+        - **first name**: Guest's first name
+        - **last name**: Guest's last name  
+        - **party**: Party/group information
+        - **tags**: Comma-separated tags (e.g., "B Wedding, B Reception, Save the Date")
+        - **mehendi rsvp**: RSVP status ("attending", "not attending", or empty)
+        - **sangeet rsvp**: RSVP status ("attending", "not attending", or empty)
+        - **wedding rsvp**: RSVP status ("attending", "not attending", or empty)
+        - **reception rsvp**: RSVP status ("attending", "not attending", or empty)
+        - **haldi rsvp**: RSVP status ("attending", "not attending", or empty)
+        """)
+    
     # Load and validate data
-    try:
-        df = load_and_process_data()
-        st.success(f"✅ Loaded {len(df)} guests successfully!")
-    except Exception as e:
-        st.error(f"❌ Error loading data: {e}")
+    df = load_and_process_data(uploaded_file)
+    
+    if df is None:
+        if uploaded_file is None:
+            st.info("👆 Please upload your guest list CSV file to begin analysis")
+        else:
+            st.error("❌ Error processing the uploaded file. Please check the format and try again.")
         st.stop()
     
+    st.success(f"✅ Loaded {len(df)} guests successfully!")
+    
+    # Only proceed if we have valid data
     stats_df = get_event_stats(df)
     
     # Create navigation tabs
@@ -177,8 +257,8 @@ def main():
         )
         
         # Invitations by side
-        fig.add_trace(go.Bar(name='Bride Side', x=stats_df['Event'], y=stats_df['Bride Invites'], marker_color=COLOR_BRIDE, showlegend=False), row=1, col=1)
-        fig.add_trace(go.Bar(name='Groom Side', x=stats_df['Event'], y=stats_df['Groom Invites'], marker_color=COLOR_GROOM,  showlegend=False), row=1, col=1)
+        fig.add_trace(go.Bar(name='Bride Side', x=stats_df['Event'], y=stats_df['Bride Invites'], marker_color=COLOR_BRIDE), row=1, col=1)
+        fig.add_trace(go.Bar(name='Groom Side', x=stats_df['Event'], y=stats_df['Groom Invites'], marker_color=COLOR_GROOM), row=1, col=1)
         
         # RSVP status
         fig.add_trace(go.Bar(name='Attending', x=stats_df['Event'], y=stats_df['Yes RSVPs'], marker_color=COLOR_RSVP_YES, showlegend=False), row=1, col=2)
